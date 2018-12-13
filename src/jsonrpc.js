@@ -165,6 +165,6 @@ module.exports = {
   makeResult: MakeResult,
   makeError: MakeError,
   getType: GetType,
-  validResponses: [ 'rpcnotify', 'rpcrequest', 'rpcresult', 'rpcerror' ]
+  validTypes: [ 'rpcnotify', 'rpcrequest', 'rpcresult', 'rpcerror' ]
 };
 

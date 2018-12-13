@@ -2,24 +2,45 @@ const { EventEmitter } = require( 'events' );
 const JsonRpc = require( './jsonrpc.js' );
 const { CreateInferface } = require( 'readline' );
 
+class FakeLogger {
+  emerg( ) { }
+  alert( ) { }
+  crit( ) { }
+  err( ) { }
+  warning( ) { }
+  notice( ) { }
+  info( ) { }
+  debug( ) { }
+}
+
 class RpcChild extends EventEmitter {
-  constructor( child ) {
+  /**
+   * @param {string} path - Al recibir entradas por 'stdout' o 'stderr', se envia esto como segundo argumento del evento.
+   *                        También se envía al logger al recibir logs desde el hijo.
+   * @param {*} child - Hijo, tal y como lo devuelven las funciones de 'child_process'.
+   * @param {*} logger - Instancia de clase logger, a la que se enviaran los logs.
+   */
+  constructor( path, child, logger ) {
+    if( ( logger === null ) || ( logger == undefined ) ) logger = new FakeLogger( );
+
     super( );
 
     this.$child = child;
     this.$stdout = CreateInferface( child.stdout );
     this.$stderr = CreateInterface( child.stderr );
     this.$queue = { };
+    this.$path = path;
+    this.$logger = logger;
     this.$id = 0;
 
     this.$stdout.on( 'line', ( line ) => this.$onStdout( line ) );
-    this.$stderr.on( 'line', ( line ) => this.$onStderr( line ) );
+    this.$stderr.on( 'line', ( line ) => this.emit( 'stderr', line, this ) );
   }
 
   $nextId( ) {
     var retId = ++this.$id;
 
-    if( retId == 10000 ) {
+    if( retId == 2147483647 ) {
       this.$id = 1;
       retId = 1;
     }
@@ -74,9 +95,14 @@ class RpcChild extends EventEmitter {
   clear( id ) {
     var work = this.$queue[id];
 
+    // Si no está en la cola, no hay nada que hacer.
+    if( work === undefined ) return;
+
+    // Quitamos los timeouts, si los tenía.
     if( work[0] ) clearTimeout( work[0] );
     if( work[1] ) clearTimeout( work[0] );
 
+    // Y lo quitamos de la cola.
     delete this.$queue[id];
   }
 
@@ -103,10 +129,39 @@ class RpcChild extends EventEmitter {
     this.emit( 'produceTimeout', id, this );
   }
 
-  $onStderr( line ) {
-  }
-
   $onStdout( line ) {
+    var jsonObject,
+        rpcType;
+
+    if( line[0] == '{' ) {
+      // Supuestamente, es un JSON.
+      try {
+        jsonObject = JSON.parse( line );
+      } catch( err ) {
+        rpcType = err.msg;
+      }
+    } else {
+      rpcType = 'Not a JSON';
+    }
+
+    if( rpcType !== undefined ) {
+      // Error al parsear el JSON.
+      this.emit( 'parseError', rpcType );
+      return;
+    }
+
+    rpcType = JsonRpc.getType( jsonObject );
+    if( !JsonRpc.validTypes.includes( rpcType ) ) {
+      this.emit( 'parseError', rpcType );
+      return;
+    }
+  
+    // Si llegamos aquí, es un JSONRPC válido.
+    // Si tiene 'id', la quitamos de la cola.
+    if( 'id' in jsonObject ) this.clear( jsonObject.id );
+
+    // Por último, emitimos la señal.
+    emit( rpcType, jsonObject, this );
   }
 
   static exec( command, options ) {
