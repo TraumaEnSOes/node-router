@@ -1,138 +1,67 @@
 const { EventEmitter } = require( 'events' );
-const { CreateInferface } = require( 'readline' );
+const Readline = require( 'readline' );
 const { exec: Exec, execFile: ExecFile, fork: Fork, spawn: Spawn } = require( 'child_process' );
 const JsonRpc = require( './jsonrpc.js' );
+const Work = require( './work.js' );
 
 class RpcChild extends EventEmitter {
   get userData( ) { return this.$userData; }
-  // Total de mensajes enviados.
-  get sends( ) { return this.$sendsCount; }
-  // Total de mensajes recibidos.
-  get receiveds( ) { return this.$receivedsCount; }
+  get killed( ) { return this.$child.killed; }
+
   /**
    * @param {*} child - Hijo, tal y como lo devuelven las funciones de 'child_process'.
    * @param {*} [userData] - No usado internamente. Para colocar cualquier dato que sea necesario.
    */
   constructor( child, userData ) {
-    if( ( logger === null ) || ( logger == undefined ) ) logger = new FakeLogger( );
-
     super( );
 
     this.$userData = userData;
+    this.$child = child;
     this.$stdin = child.stdin;
-    this.$stdout = CreateInferface( {
+    this.$stdout = Readline.createInterface( {
       input: child.stdout,
       terminal: false
     } );
-    this.$stderr = CreateInterface( {
+    this.$stderr = Readline.createInterface( {
       input: child.stderr,
       terminal: false
     } );
-    this.$queue = { };
-    this.$path = path;
+    this.$clientQueue = { };
+    this.$serverQueue = { };
     this.$id = 0;
-    this.$sendsCount = 0;
-    this.$receivedsCount = 0;
 
-    child.on( 'exit', ( code, signal ) => $onChildExit( code, signal ) );
+    child.on( 'exit', ( code, signal ) => this.$onChildExit( code, signal ) );
     this.$stdout.on( 'line', ( line ) => this.$onStdout( line ) );
     this.$stderr.on( 'line', ( line ) => this.emit( 'stderr', line, this ) );
   }
 
   $nextId( ) {
     var retId = ++this.$id;
-
+  
     if( retId == 2147483647 ) {
       this.$id = 1;
       retId = 1;
     }
-
+  
     return retId;
   }
+  
+  $send( consume, produce, id, jsonObject, queue ) {
+    var work = new Work( id );
 
-  $send( consume, produce, id, jsonObject ) {
-    var work;
+    if( queue[id] !== undefined ) throw Error( '"id" exists yet' );
 
-    if( id in this.$queue ) throw Error( '"id" exists yet' );
-    if( !( consume || produce ) ) throw Error( '"consume" and "produce", both 0' );
+    queue[id] = work;
 
-    work = [
-      consume ? setTimeout( consume * 1000, ( ) => this.$timeoutConsume ) : false,
-      produce ? setTimeout( produce * 1000, ( ) => this.$timeoutProduce ) : false
-    ];
+    // Nos suscribimos a los eventos 'timeout' del work.
+    work.on( 'timeout', ( type, w ) => this.emit( 'timeout', type, jsonObject, this ) );
 
-    this.$queue[id] = work;
-    ++this.$sendsCount;
-    this.$stdin.write( jsonObject, null, ( ) => this.$ontimeConsume( id ) );
+    work.write( consume, produce, this.$stdin, JSON.stringify( jsonObject ) );
   }
 
-  notify( consume, methodName, args ) {
-    var id = this.$nextId,
-        jsonObject = JsonRpc.makeNotify( methodName, args );
-
-    return this.$send( consume, 0, id, jsonObject );
-  }
-
-  request( consume, produce, methodName, args ) {
-    var id = this.$nextId( ),
-        jsonObject = JsonRpc.makeRequest( methodName, args );
-
-    return this.$send( consume, produce, id, jsonObject );
-  }
-
-  clearAll( ) {
-    var key,
-        value,
-        queue = this.$queue;
-
-    this.$queue = { }
-    this.$id = 0;
-
-    for( [ key, value ] of Object.entries( queue ) ) {
-      if( queue.hasOwnProperty( key ) ) {
-        if( value[0] ) clearTimeout( value[0] );
-        if( value[1] ) clearTimeout( value[1] );
-      }
-    }
-  }
-
-  // Quita un 'id' de la cola, limpiando sus timeouts.
-  clear( id ) {
-    var work = this.$queue[id];
-
-    // Si no está en la cola, no hay nada que hacer.
-    if( work === undefined ) return;
-
-    // Quitamos los timeouts, si los tenía.
-    if( work[0] ) clearTimeout( work[0] );
-    if( work[1] ) clearTimeout( work[0] );
-
-    // Y lo quitamos de la cola.
-    delete this.$queue[id];
-  }
-
-  // Se realizó el 'consume' dentro del plazo.
-  $ontimeConsume( id ) {
-    var work = this.$queue[id];
-
-    if( work[0] ) {
-      clearTimeout( work[0] );
-      work[0] = false;
-    }
-
-    if( !( work[1] ) ) delete this.$queue[id];
-  }
-
-  // 'timeout' del consume. El hijo ha tardado mucho en obtener nuestros datos.
-  $timeoutConsume( id ) {
-    this.$queue[id][0] = false;
-    this.emit( 'consumeTimeout', id, this );
-  }
-
-  // 'timeout' del produce. El hijo ha tardado mucho en responder.
-  $timeoutProduce( id ) {
-    this.clear( id );
-    this.emit( 'produceTimeout', id, this );
+  $onChildExit( code, signal ) {
+    this.clearAll( );
+    this.emit( 'exit', code, signal, this );
   }
 
   // Al recibir una línea desde la salida estandar del hijo.
@@ -151,72 +80,182 @@ class RpcChild extends EventEmitter {
       rpcType = 'Not a JSON';
     }
 
-    if( rpcType !== undefined ) {
-      // Error al parsear el JSON.
-      // Lanzamos la señal.
-      this.emit( 'stdout', line, rpcType, this );
+    // Si no hubo ningún error, obtenemos el tipo del JSONRPC.
+    if( rpcType !== undefined ) rpcType = JsonRpc.getType( jsonObject );
+
+    if( !JsonRpc.validTypes.includes( rcpType ) ) {
+      // Algún error con el JSON o con el parseo del JSONRPC.
+      this.emit( 'stdout', rpcType, line, this );
       return;
     }
 
-    rpcType = JsonRpc.getType( jsonObject );
-    if( !JsonRpc.validTypes.includes( rpcType ) ) {
-      // No es un JSONRPC válido.
-      this.emit( 'stdout', line, rpcType, this );
-      return;
-    }
-  
-    // Si llegamos aquí, es un JSONRPC válido.
-    
-    if( 'id' in jsonObject ) {
-      ++this.$receivedsCount;
+    // Al llegar aquí, es un JSONRPC válido.
+    if( ( rpcType == 'rpcresult' ) || ( rpcType == 'rpcerror' ) ) {
+      // Estos mensajes pasan por la cola.
+      let id = jsonObject.id,
+          work = this.$clientQueue[id];
 
-      // Si tiene 'id', la quitamos de la cola.
-      this.clear( jsonObject.id );
-      // Y por último, emitimos la señal.
-      emit( rpcType, jsonObject, this );
-    } else {
-      // No está en la cola. ¿ Llegó fuera de tiempo ?
-      this.emit( 'unexpected', jsonObject, this );
+      if( work === undefined ) {
+        // No tenemos esa id en la cola ¿ Nos llegó tarde ?
+        this.emit( 'unexpected', jsonObject, this );
+        return;
+      }
+
+      // Quitamos los timeouts
+      work.finish( );
+      delete this.$clientQueue[id];
+    }
+
+    // Si es un 'rpcnotify' o un 'rpcrequest', no han pasado por la cola.
+
+    // Todo listo. Emitimos el evento.
+    this.emit( rpcType, jsonObject, this );
+  }
+
+  // Copia las posibles optiones soportadas.
+  // Son todas datos primitivos, por lo que no hay problema.
+  // El único dato de tipo 'object' es 'userData'; este se copia igual, para permitir que
+  // esté compartido entre esta clase y quien nos llame.
+  static $makeRealOptions( opts ) {
+    var key,
+        ret = { };
+
+    if( ( typeof( opts ) !== 'object' ) || ( opts === null ) ) return { windowsHide: true };
+
+    for( key in opts ) if( Object.hasOwnProperty( key ) ) ret[key] = opts[key];
+
+    ret.windowsHide = true;
+
+    return ret;
+  }
+
+  // Mata el hijo, enviando la señal (por defecto, 'SIGTERM'.
+  kill( signal ) { $this.$child.kill( signal ); }
+
+  /**
+   * Envía un 'notify' al hijo.
+   * No se espera respuesta de estos mensajes. Solo tienen timeout para el consume.
+   * 
+   * @param {number} consume - timeout, en segundos.
+   * @param {string} methodName - nombre del método a invocar.
+   * @param {*} [args] - Argumentos.
+   */
+  notify( consume, methodName, args ) {
+    var id = this.$nextId( ),
+        jsonObject = JsonRpc.makeNotify( methodName, args );
+
+    return this.$send( consume, false, id, jsonObject, this.$clientQueue );
+  }
+
+  /**
+   * Envía un petición al hijo. Si esperamos respuesta.
+   * 
+   * @param {number} consume - timeout, en segundos.
+   * @param {number} produce - timeout, en segundos.
+   * @param {string} methodName - nombre del método a invocar.
+   * @param {*} [args] - Argumentos.
+   */
+  request( consume, produce, methodName, args ) {
+    var id = this.$nextId( ),
+        jsonObject = JsonRpc.makeRequest( id, methodName, args );
+
+    return this.$send( consume, produce, id, jsonObject, this.$clientQueue );
+  }
+
+  /**
+   * Envía una respuesta correcta al hijo.
+   * 
+   * @param {number} consume - timeout, en segundos.
+   * @param {*} id - identificador de la solicitud a la que respondemos.
+   * @param {*} result - datos enviados en la respuesta.
+   */
+  result( consume, id, result ) {
+    var jsonObject = JsonRpc.makeResult( id, result );
+
+    return this.$send( consume, false, id, jsonObject, this.$serverQueue );
+  }
+
+  /**
+   * Envía una respuesta de error al hijo.
+   * 
+   * @param {number} consume - timeout, en segundos.
+   * @param {*} id - identificador de la solicitud a la que respondemos.
+   * @param {number} code - código de error.
+   * @param {string} message - texto del error.
+   * @param {*} [data] - datos opcionales a añadir.
+   */
+  error( consume, id, code, message, data ) {
+    var jsonObject = JsonRpc.makeError( id, code, message, data );
+
+    return this.$send( consume, false, id, jsonObject, this.$serverQueue );
+  }
+
+  clearAll( ) {
+    var key,
+        value,
+        queue = this.$queue;
+
+    this.$queue = { }
+    this.$id = 0;
+
+    for( [ key, value ] of Object.entries( queue ) ) {
+      if( queue.hasOwnProperty( key ) ) {
+        if( value[0] ) clearTimeout( value[0] );
+        if( value[1] ) clearTimeout( value[1] );
+      }
     }
   }
 
+  /**
+   * 
+   * @param {string} command - Orden a ejecutar.
+   * @param {*} [options] - Opciones.
+   */
   static exec( command, options ) {
-    if( ( options === null ) && ( options === undefined ) ) options = { }
+    var realOptions = RpcChild.$makeRealOptions( options );
 
-    // Sobreescribimos las opciones que necesitamos.
-    options.windowsHide = true;
-
-    return new RpcChild( Exec( command, options ), options.userData );
+    return new RpcChild( Exec( command, realOptions ), realOptions.userData );
   }
 
+  /**
+   * 
+   * @param {string} file - Archivo a ejecutar.
+   * @param {Array|null} args - Opciones. Si no se usan, ha de ser 'null'
+   * @param {*} [options] - Opciones.
+   */
   static execFile( file, args, options ) {
-    if( ( options === null ) && ( options === undefined ) ) options = { }
+    var realOptions = RpcChild.$makeRealOptions( options );
 
-    // Sobreescribimos las opciones que necesitamos.
-    options.windowsHide = true;
-
-    return new RpcChild( ExecFile( file, args, options ), options.userData );
+    return new RpcChild( ExecFile( file, args, realOptions ), realOptions.userData );
   }
 
+  /**
+   * 
+   * @param {string} modulePath - Rutal al arhcivo '.js'.
+   * @param {Array|null} args - Argumentos a pasar. Si no se pasa ninguno, ha de ser 'null'.
+   * @param {*} [options] - Opciones.
+   */
   static fork( modulePath, args, options ) {
-    if( ( options === null ) && ( options === undefined ) ) options = { }
+    var realOptions = RpcChild.$makeRealOptions( options );
 
-    // Sobreescribimos las opciones que necesitamos.
-    options.windowsHide = true;
-    options.stdio = 'pipe';
+    realOptions.stdio = 'pipe';
 
-    return new RpcChild( Fork( modulePath, args, options ), options.userData );
+    return new RpcChild( Fork( modulePath, args, realOptions ), realOptions.userData );
   }
 
+  /**
+   * 
+   * @param {string} command - Orden a ejecutar.
+   * @param {Array|null} args - Argumentos a pasar. Si no se usa, ha de ser 'null'.
+   * @param {*} [options] - Opciones.
+   */
   static spawn( command, args, options ) {
-    if( ( options === null ) && ( options === undefined ) ) options = { }
+    var realOptions = RpcChild.$makeRealOptions( options );
 
-    // Sobreescribimos las opciones que necesitamos.
-    options.windowsHide = true;
-    options.stdio = 'pipe';
-    options.detached = false;
+    realOptions.stdio = 'pipe';
+    realOptions.detached = false;
 
-    return new RpcChild( Spawn( command, args, options ), options.userData );
+    return new RpcChild( Spawn( command, args, realOptions ), realOptions.userData );
   }
 };
 
